@@ -10,6 +10,7 @@ const cron = require('node-cron');
 const app = express();
 
 // Middleware
+// CORS configuration - FIXED FOR PRODUCTION
 app.use(cors({
     origin: [
         'http://localhost:8000',
@@ -25,17 +26,19 @@ app.options('*', cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Session
+// Session configuration - FIXED FOR PRODUCTION
 app.use(session({
     secret: process.env.SESSION_SECRET || 'rollcall-secret',
     resave: false,
     saveUninitialized: false,
     cookie: { 
-        secure: false,
+        secure: true,           // MUST be true for HTTPS (Render uses HTTPS)
         httpOnly: true,
-        maxAge: 24 * 60 * 60 * 1000
-    }
-}));
+        sameSite: 'none',        // Required for cross-site requests (Vercel to Render)
+        maxAge: 24 * 60 * 60 * 1000 // 24 hours
+    },
+    proxy: true // Trust the reverse proxy (Render)
+}));;
 
 // Database
 const db = mysql.createConnection({
@@ -265,6 +268,7 @@ cron.schedule('0 10 * * *', () => {
 });
 
 // ========== AUTH ROUTES ==========
+// Login route - FIXED
 app.post('/api/login', (req, res) => {
     console.log('📝 Login attempt:', req.body.username);
     
@@ -284,7 +288,25 @@ app.post('/api/login', (req, res) => {
         if (password === admin.password) {
             req.session.userId = admin.id;
             req.session.username = admin.username;
-            res.json({ success: true, user: { username: admin.username, email: admin.email } });
+            
+            // Save session explicitly
+            req.session.save((err) => {
+                if (err) {
+                    console.error('Session save error:', err);
+                    return res.status(500).json({ error: 'Session error' });
+                }
+                
+                console.log('✅ Login successful for:', username);
+                res.json({ 
+                    success: true, 
+                    message: 'Login successful',
+                    user: { 
+                        id: admin.id,
+                        username: admin.username,
+                        email: admin.email 
+                    }
+                });
+            });
         } else {
             res.status(401).json({ error: 'Invalid credentials' });
         }
@@ -297,8 +319,22 @@ app.post('/api/logout', (req, res) => {
     });
 });
 
+// Check auth route - FIXED
 app.get('/api/check-auth', (req, res) => {
-    res.json({ loggedIn: !!req.session.userId, user: req.session.user });
+    console.log('🔍 Check-auth called. Session:', req.sessionID);
+    console.log('User ID:', req.session.userId);
+    
+    if (req.session.userId) {
+        res.json({ 
+            loggedIn: true, 
+            user: { 
+                id: req.session.userId,
+                username: req.session.username 
+            } 
+        });
+    } else {
+        res.json({ loggedIn: false });
+    }
 });
 
 app.get('/', (req, res) => {
