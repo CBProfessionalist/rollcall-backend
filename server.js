@@ -11,7 +11,7 @@ const app = express();
 
 // Middleware
 app.use(cors({
-    origin: ['http://localhost:8000', 'https://rollcall-frontend.vercel.app'],
+    origin: ['http://localhost:8000', 'https://rollcall-frontend1.vercel.app'],
     credentials: true
 }));
 
