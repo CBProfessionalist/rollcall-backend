@@ -6,6 +6,7 @@ const bodyParser = require('body-parser');
 const session = require('express-session');
 const nodemailer = require('nodemailer');
 const cron = require('node-cron');
+const sgMail = require('@sendgrid/mail');
 
 const app = express();
 
@@ -66,42 +67,26 @@ const requireLogin = (req, res, next) => {
     }
 };
 
-// ========== EMAIL CONFIGURATION ==========
-// Email configuration - FIXED FOR RENDER (using port 587)
-const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
-    secure: false, // true for 465, false for 587
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-    },
-    tls: {
-        rejectUnauthorized: false,
-        ciphers: 'SSLv3'
-    },
-    connectionTimeout: 30000, // 30 seconds
-    greetingTimeout: 30000,
-    socketTimeout: 30000,
-    debug: true // Enable debug logs
-});
-
-// Test email connection
-transporter.verify((error, success) => {
-    if (error) {
-        console.log('❌ Email configuration error:', error.message);
-        console.log('📧 Email notifications may not work - check port 587');
-        console.log('📧 Make sure EMAIL_USER and EMAIL_PASS are set in environment');
-    } else {
-        console.log('✅ Email server ready on port 587');
-    }
-});
+// ========== EMAIL CONFIGURATION (SENDGRID) ==========
+// Initialize SendGrid with API key
+if (process.env.SENDGRID_API_KEY) {
+    sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+    console.log('✅ SendGrid initialized');
+} else {
+    console.log('❌ SENDGRID_API_KEY not set - email disabled');
+}
 
 // Store sent alerts to prevent duplicates
 const sentAlerts = new Set();
 
 // ========== EMAIL FUNCTIONS ==========
 async function sendAbsenceAlert(student, daysAbsent, alertType) {
+    // Check if SendGrid is configured
+    if (!process.env.SENDGRID_API_KEY) {
+        console.log('📧 SendGrid not configured - email skipped');
+        return;
+    }
+    
     // Check if notifications are enabled
     db.query('SELECT setting_value FROM settings WHERE setting_key = "notifications_enabled"', async (err, result) => {
         if (err) {
@@ -134,9 +119,9 @@ async function sendAbsenceAlert(student, daysAbsent, alertType) {
             
             console.log(`📧 Preparing to send ${alertType} email for ${student.student_name} to ${recipient}`);
             
-            const mailOptions = {
-                from: `"Rollcall System" <${process.env.EMAIL_USER}>`,
+            const msg = {
                 to: recipient,
+                from: process.env.FROM_EMAIL || 'noreply@rollcall.com', // Must be verified in SendGrid
                 subject: `⚠️ Attendance Alert: ${student.student_name} - ${alertType}`,
                 html: `
                     <!DOCTYPE html>
@@ -221,27 +206,18 @@ async function sendAbsenceAlert(student, daysAbsent, alertType) {
             };
 
             try {
-                console.log(`📧 Sending email for ${student.student_name}...`);
-                const info = await transporter.sendMail(mailOptions);
+                console.log(`📧 Sending email for ${student.student_name} via SendGrid...`);
+                await sgMail.send(msg);
                 console.log(`✅ Email sent successfully for ${student.student_name}`);
-                console.log(`📧 Message ID: ${info.messageId}`);
             } catch (error) {
                 console.error(`❌ Failed to send email for ${student.student_name}:`, error.message);
-                console.error('Error code:', error.code);
-                console.error('Command:', error.command);
-                
-                // Log additional details for debugging
-                console.log('📧 Email configuration:', {
-                    host: 'smtp.gmail.com',
-                    port: 587,
-                    user: process.env.EMAIL_USER ? 'Set' : 'Not set',
-                    recipient: recipient
-                });
+                if (error.response) {
+                    console.error('SendGrid response:', error.response.body);
+                }
             }
         });
     });
 }
-
 // Check for absent students
 async function checkAbsences() {
     console.log('🔍 Running absence check at:', new Date().toLocaleString());
