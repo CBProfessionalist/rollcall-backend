@@ -38,7 +38,7 @@ app.use(session({
         maxAge: 24 * 60 * 60 * 1000 // 24 hours
     },
     proxy: true // Trust the reverse proxy (Render)
-}));;
+}));
 
 // Database
 const db = mysql.createConnection({
@@ -57,7 +57,7 @@ db.connect((err) => {
     console.log('✅ Connected to Railway database');
 });
 
-// ========== AUTH MIDDLEWARE (DEFINE THIS FIRST) ==========
+// ========== AUTH MIDDLEWARE ==========
 const requireLogin = (req, res, next) => {
     if (req.session.userId) {
         next();
@@ -67,20 +67,33 @@ const requireLogin = (req, res, next) => {
 };
 
 // ========== EMAIL CONFIGURATION ==========
+// Email configuration - FIXED FOR RENDER (using port 587)
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false, // true for 465, false for 587
     auth: {
         user: process.env.EMAIL_USER,
         pass: process.env.EMAIL_PASS
-    }
+    },
+    tls: {
+        rejectUnauthorized: false,
+        ciphers: 'SSLv3'
+    },
+    connectionTimeout: 30000, // 30 seconds
+    greetingTimeout: 30000,
+    socketTimeout: 30000,
+    debug: true // Enable debug logs
 });
 
 // Test email connection
 transporter.verify((error, success) => {
     if (error) {
-        console.log('❌ Email configuration error:', error);
+        console.log('❌ Email configuration error:', error.message);
+        console.log('📧 Email notifications may not work - check port 587');
+        console.log('📧 Make sure EMAIL_USER and EMAIL_PASS are set in environment');
     } else {
-        console.log('✅ Email server ready');
+        console.log('✅ Email server ready on port 587');
     }
 });
 
@@ -91,17 +104,35 @@ const sentAlerts = new Set();
 async function sendAbsenceAlert(student, daysAbsent, alertType) {
     // Check if notifications are enabled
     db.query('SELECT setting_value FROM settings WHERE setting_key = "notifications_enabled"', async (err, result) => {
-        if (err || result.length === 0) return;
+        if (err) {
+            console.error('❌ Error checking notification settings:', err);
+            return;
+        }
+        
+        if (result.length === 0) {
+            console.log('📧 No notification settings found');
+            return;
+        }
         
         const notificationsEnabled = result[0].setting_value === 'true';
         if (!notificationsEnabled) {
-            console.log('📧 Notifications are disabled');
+            console.log('📧 Notifications are disabled in settings');
             return;
         }
         
         // Get recipient email
         db.query('SELECT setting_value FROM settings WHERE setting_key = "email_recipient"', async (err, emailResult) => {
-            const recipient = (emailResult && emailResult[0]) ? emailResult[0].setting_value : process.env.ADMIN_EMAIL || 'admin@school.edu';
+            if (err) {
+                console.error('❌ Error fetching email recipient:', err);
+                return;
+            }
+            
+            let recipient = process.env.ADMIN_EMAIL || 'admin@school.edu';
+            if (emailResult && emailResult.length > 0) {
+                recipient = emailResult[0].setting_value;
+            }
+            
+            console.log(`📧 Preparing to send ${alertType} email for ${student.student_name} to ${recipient}`);
             
             const mailOptions = {
                 from: `"Rollcall System" <${process.env.EMAIL_USER}>`,
@@ -119,7 +150,7 @@ async function sendAbsenceAlert(student, daysAbsent, alertType) {
                             .alert-box { background: ${alertType.includes('URGENT') ? '#ff1744' : '#ff9800'}; color: white; padding: 15px; border-radius: 5px; margin: 20px 0; }
                             table { width: 100%; border-collapse: collapse; margin: 20px 0; }
                             td { padding: 10px; border-bottom: 1px solid #ddd; }
-                            .label { font-weight: bold; width: 40%; }
+                            .label { font-weight: bold; width: 40%; background: #f0f0f0; }
                             .footer { text-align: center; margin-top: 20px; color: #666; font-size: 12px; }
                         </style>
                     </head>
@@ -129,7 +160,7 @@ async function sendAbsenceAlert(student, daysAbsent, alertType) {
                                 <h1>📱 Rollcall Attendance System</h1>
                             </div>
                             <div class="content">
-                                <h2 style="color: #333;">Attendance Alert</h2>
+                                <h2 style="color: #333; margin-top: 0;">Attendance Alert</h2>
                                 
                                 <div class="alert-box">
                                     <strong>⚠️ ${alertType}</strong>
@@ -153,21 +184,35 @@ async function sendAbsenceAlert(student, daysAbsent, alertType) {
                                         <td><strong>${daysAbsent} day${daysAbsent > 1 ? 's' : ''}</strong></td>
                                     </tr>
                                     <tr>
+                                        <td class="label">Alert Type:</td>
+                                        <td><strong style="color: ${alertType.includes('URGENT') ? '#ff1744' : '#ff9800'}">${alertType}</strong></td>
+                                    </tr>
+                                    <tr>
                                         <td class="label">Date:</td>
                                         <td>${new Date().toLocaleDateString()}</td>
                                     </tr>
                                 </table>
                                 
-                                <p style="background: #fff3e0; padding: 15px; border-radius: 5px;">
+                                <p style="background: #fff3e0; padding: 15px; border-radius: 5px; border-left: 4px solid #ff9800;">
                                     <strong>Action Required:</strong> Please follow up with this student regarding their attendance.
                                 </p>
                                 
-                                <p>
-                                    <a href="http://localhost:8000/login.html" style="background: #00f2fe; color: #0a0f1f; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">Login to Dashboard</a>
-                                </p>
+                                <div style="text-align: center; margin-top: 30px;">
+                                    <a href="https://rollcall-frontend.vercel.app/login.html" 
+                                       style="background: linear-gradient(135deg, #00f2fe, #4facfe); 
+                                              color: #0a0f1f; 
+                                              padding: 12px 30px; 
+                                              text-decoration: none; 
+                                              border-radius: 5px; 
+                                              font-weight: bold;
+                                              display: inline-block;">
+                                        🔐 Login to Dashboard
+                                    </a>
+                                </div>
                             </div>
                             <div class="footer">
                                 <p>This is an automated message from your Rollcall Attendance System.</p>
+                                <p style="font-size: 10px;">© ${new Date().getFullYear()} Rollcall Scanner</p>
                             </div>
                         </div>
                     </body>
@@ -176,10 +221,22 @@ async function sendAbsenceAlert(student, daysAbsent, alertType) {
             };
 
             try {
-                await transporter.sendMail(mailOptions);
-                console.log(`✅ Email sent for ${student.student_name} - ${alertType}`);
+                console.log(`📧 Sending email for ${student.student_name}...`);
+                const info = await transporter.sendMail(mailOptions);
+                console.log(`✅ Email sent successfully for ${student.student_name}`);
+                console.log(`📧 Message ID: ${info.messageId}`);
             } catch (error) {
-                console.error('❌ Failed to send email:', error);
+                console.error(`❌ Failed to send email for ${student.student_name}:`, error.message);
+                console.error('Error code:', error.code);
+                console.error('Command:', error.command);
+                
+                // Log additional details for debugging
+                console.log('📧 Email configuration:', {
+                    host: 'smtp.gmail.com',
+                    port: 587,
+                    user: process.env.EMAIL_USER ? 'Set' : 'Not set',
+                    recipient: recipient
+                });
             }
         });
     });
@@ -201,6 +258,8 @@ async function checkAbsences() {
             return;
         }
         
+        console.log(`📊 Found ${students.length} students to check`);
+        
         for (const student of students) {
             // Get attendance for last 5 days
             db.query(
@@ -211,6 +270,11 @@ async function checkAbsences() {
                     
                     const daysPresent = attendance.length;
                     const daysAbsent = 5 - daysPresent;
+                    
+                    // Only process if student has been absent
+                    if (daysAbsent === 0) return;
+                    
+                    console.log(`📊 ${student.student_name}: ${daysPresent} present, ${daysAbsent} absent`);
                     
                     // Create a unique key for this alert
                     const alertKey = `${student.id}_${today}_${daysAbsent}`;
@@ -243,14 +307,17 @@ async function checkAbsences() {
                         
                         // Send alerts based on absence duration
                         if (daysAbsent >= 5 && !sentAlerts.has(alertKey + '_5')) {
+                            console.log(`⚠️ Sending URGENT alert for ${student.student_name} (${daysAbsent} days)`);
                             await sendAbsenceAlert(student, daysAbsent, '5+ DAYS - URGENT');
                             sentAlerts.add(alertKey + '_5');
                         }
                         else if (daysAbsent === 3 && !sentAlerts.has(alertKey + '_3')) {
+                            console.log(`⚠️ Sending 3-day alert for ${student.student_name}`);
                             await sendAbsenceAlert(student, daysAbsent, '3 DAYS CONSECUTIVE');
                             sentAlerts.add(alertKey + '_3');
                         }
                         else if (daysAbsent === 1 && !sentAlerts.has(alertKey + '_1')) {
+                            console.log(`⚠️ Sending 1-day alert for ${student.student_name}`);
                             await sendAbsenceAlert(student, daysAbsent, '1 DAY ABSENCE');
                             sentAlerts.add(alertKey + '_1');
                         }
@@ -341,10 +408,11 @@ app.get('/', (req, res) => {
     res.json({ message: '🎓 Rollcall API', status: 'running' });
 });
 
-// ========== PROTECTED ROUTES (use requireLogin) ==========
+// ========== PROTECTED ROUTES ==========
 
 // Manual trigger for testing
 app.get('/api/check-absences', requireLogin, (req, res) => {
+    console.log('👤 Manual absence check triggered by:', req.session.username);
     checkAbsences();
     res.json({ message: 'Absence check started' });
 });
@@ -514,4 +582,5 @@ app.delete('/api/holidays/:id', requireLogin, (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📧 Email configured for: ${process.env.EMAIL_USER || 'Not set'}`);
 });
