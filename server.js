@@ -11,10 +11,17 @@ const app = express();
 
 // Middleware
 app.use(cors({
-    origin: ['http://localhost:8000', 'https://rollcall-frontend.vercel.app'],
-    credentials: true
+    origin: [
+        'http://localhost:8000',
+        'https://rollcall-frontend-61ovs9ov1-naqshs-projects-fe659bc5.vercel.app',
+        'https://rollcall-frontend.vercel.app'
+    ],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
+app.options('*', cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
