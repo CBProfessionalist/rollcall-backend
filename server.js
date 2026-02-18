@@ -4,9 +4,8 @@ const mysql = require('mysql2');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 const session = require('express-session');
-const nodemailer = require('nodemailer');
 const cron = require('node-cron');
-const sgMail = require('@sendgrid/mail');
+const { google } = require('googleapis');
 
 const app = express();
 
@@ -67,23 +66,101 @@ const requireLogin = (req, res, next) => {
     }
 };
 
-// ========== EMAIL CONFIGURATION (SENDGRID) ==========
-// Initialize SendGrid with API key
-if (process.env.SENDGRID_API_KEY) {
-    sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-    console.log('✅ SendGrid initialized');
-} else {
-    console.log('❌ SENDGRID_API_KEY not set - email disabled');
-}
-
+// ========== GMAIL API CONFIGURATION ==========
 // Store sent alerts to prevent duplicates
 const sentAlerts = new Set();
 
+// Create OAuth2 client
+const oauth2Client = new google.auth.OAuth2(
+    process.env.GMAIL_CLIENT_ID,
+    process.env.GMAIL_CLIENT_SECRET,
+    'http://localhost'
+);
+
+// Set credentials
+oauth2Client.setCredentials({
+    refresh_token: process.env.GMAIL_REFRESH_TOKEN,
+    access_token: process.env.GMAIL_ACCESS_TOKEN
+});
+
+// Create Gmail API client
+const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+// Auto-refresh token functionality
+oauth2Client.on('tokens', (tokens) => {
+    if (tokens.refresh_token) {
+        console.log('🔄 New refresh token received');
+        // Note: In production, you'd want to save this to your database
+        process.env.GMAIL_REFRESH_TOKEN = tokens.refresh_token;
+    }
+    if (tokens.access_token) {
+        console.log('🔄 Access token refreshed');
+        process.env.GMAIL_ACCESS_TOKEN = tokens.access_token;
+    }
+});
+
+// Test Gmail connection
+async function testGmailConnection() {
+    try {
+        // Try to get profile info to test connection
+        const profile = await gmail.users.getProfile({ userId: 'me' });
+        console.log(`✅ Gmail API connected - Email: ${profile.data.emailAddress}`);
+        return true;
+    } catch (error) {
+        console.log('❌ Gmail API connection error:', error.message);
+        return false;
+    }
+}
+
+// Call test on startup
+testGmailConnection();
+
+// Function to send email via Gmail API
+async function sendEmailViaGmail(to, subject, htmlContent) {
+    try {
+        // Create email in RFC 2822 format
+        const emailLines = [
+            `To: ${to}`,
+            'Content-Type: text/html; charset=utf-8',
+            'MIME-Version: 1.0',
+            `Subject: ${subject}`,
+            '',
+            htmlContent
+        ];
+        
+        const email = emailLines.join('\n');
+        
+        // Encode to base64url format (Gmail API requirement)
+        const encodedEmail = Buffer.from(email)
+            .toString('base64')
+            .replace(/\+/g, '-')
+            .replace(/\//g, '_')
+            .replace(/=+$/, '');
+        
+        // Send email via Gmail API
+        const res = await gmail.users.messages.send({
+            userId: 'me',
+            requestBody: {
+                raw: encodedEmail
+            }
+        });
+        
+        console.log(`✅ Email sent. Message ID: ${res.data.id}`);
+        return true;
+    } catch (error) {
+        console.error('❌ Gmail API error:', error.message);
+        if (error.response) {
+            console.error('Error details:', error.response.data);
+        }
+        return false;
+    }
+}
+
 // ========== EMAIL FUNCTIONS ==========
 async function sendAbsenceAlert(student, daysAbsent, alertType) {
-    // Check if SendGrid is configured
-    if (!process.env.SENDGRID_API_KEY) {
-        console.log('📧 SendGrid not configured - email skipped');
+    // Check if Gmail is configured
+    if (!process.env.GMAIL_CLIENT_ID || !process.env.GMAIL_REFRESH_TOKEN) {
+        console.log('📧 Gmail not configured - email skipped');
         return;
     }
     
@@ -119,105 +196,95 @@ async function sendAbsenceAlert(student, daysAbsent, alertType) {
             
             console.log(`📧 Preparing to send ${alertType} email for ${student.student_name} to ${recipient}`);
             
-            const msg = {
-                to: recipient,
-                from: process.env.FROM_EMAIL || 'noreply@rollcall.com', // Must be verified in SendGrid
-                subject: `⚠️ Attendance Alert: ${student.student_name} - ${alertType}`,
-                html: `
-                    <!DOCTYPE html>
-                    <html>
-                    <head>
-                        <style>
-                            body { font-family: Arial, sans-serif; line-height: 1.6; }
-                            .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-                            .header { background: linear-gradient(135deg, #00f2fe, #4facfe); color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }
-                            .content { background: #f5f5f5; padding: 20px; border-radius: 0 0 10px 10px; }
-                            .alert-box { background: ${alertType.includes('URGENT') ? '#ff1744' : '#ff9800'}; color: white; padding: 15px; border-radius: 5px; margin: 20px 0; }
-                            table { width: 100%; border-collapse: collapse; margin: 20px 0; }
-                            td { padding: 10px; border-bottom: 1px solid #ddd; }
-                            .label { font-weight: bold; width: 40%; background: #f0f0f0; }
-                            .footer { text-align: center; margin-top: 20px; color: #666; font-size: 12px; }
-                        </style>
-                    </head>
-                    <body>
-                        <div class="container">
-                            <div class="header">
-                                <h1>📱 Rollcall Attendance System</h1>
+            const htmlContent = `
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <style>
+                        body { font-family: Arial, sans-serif; line-height: 1.6; }
+                        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                        .header { background: linear-gradient(135deg, #00f2fe, #4facfe); color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }
+                        .content { background: #f5f5f5; padding: 20px; border-radius: 0 0 10px 10px; }
+                        .alert-box { background: ${alertType.includes('URGENT') ? '#ff1744' : '#ff9800'}; color: white; padding: 15px; border-radius: 5px; margin: 20px 0; }
+                        table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+                        td { padding: 10px; border-bottom: 1px solid #ddd; }
+                        .label { font-weight: bold; width: 40%; background: #f0f0f0; }
+                        .footer { text-align: center; margin-top: 20px; color: #666; font-size: 12px; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="header">
+                            <h1>📱 Rollcall Attendance System</h1>
+                        </div>
+                        <div class="content">
+                            <h2 style="color: #333; margin-top: 0;">Attendance Alert</h2>
+                            
+                            <div class="alert-box">
+                                <strong>⚠️ ${alertType}</strong>
                             </div>
-                            <div class="content">
-                                <h2 style="color: #333; margin-top: 0;">Attendance Alert</h2>
-                                
-                                <div class="alert-box">
-                                    <strong>⚠️ ${alertType}</strong>
-                                </div>
-                                
-                                <table>
-                                    <tr>
-                                        <td class="label">Student Name:</td>
-                                        <td>${student.student_name}</td>
-                                    </tr>
-                                    <tr>
-                                        <td class="label">Student ID:</td>
-                                        <td>${student.student_id}</td>
-                                    </tr>
-                                    <tr>
-                                        <td class="label">IC Number:</td>
-                                        <td>${student.ic_number}</td>
-                                    </tr>
-                                    <tr>
-                                        <td class="label">Days Absent:</td>
-                                        <td><strong>${daysAbsent} day${daysAbsent > 1 ? 's' : ''}</strong></td>
-                                    </tr>
-                                    <tr>
-                                        <td class="label">Alert Type:</td>
-                                        <td><strong style="color: ${alertType.includes('URGENT') ? '#ff1744' : '#ff9800'}">${alertType}</strong></td>
-                                    </tr>
-                                    <tr>
-                                        <td class="label">Date:</td>
-                                        <td>${new Date().toLocaleDateString()}</td>
-                                    </tr>
-                                </table>
-                                
-                                <p style="background: #fff3e0; padding: 15px; border-radius: 5px; border-left: 4px solid #ff9800;">
-                                    <strong>Action Required:</strong> Please follow up with this student regarding their attendance.
-                                </p>
-                                
-                                <div style="text-align: center; margin-top: 30px;">
-                                    <a href="https://rollcall-frontend.vercel.app/login.html" 
-                                       style="background: linear-gradient(135deg, #00f2fe, #4facfe); 
-                                              color: #0a0f1f; 
-                                              padding: 12px 30px; 
-                                              text-decoration: none; 
-                                              border-radius: 5px; 
-                                              font-weight: bold;
-                                              display: inline-block;">
-                                        🔐 Login to Dashboard
-                                    </a>
-                                </div>
-                            </div>
-                            <div class="footer">
-                                <p>This is an automated message from your Rollcall Attendance System.</p>
-                                <p style="font-size: 10px;">© ${new Date().getFullYear()} Rollcall Scanner</p>
+                            
+                            <table>
+                                <tr>
+                                    <td class="label">Student Name:</td>
+                                    <td>${student.student_name}</td>
+                                </tr>
+                                <tr>
+                                    <td class="label">Student ID:</td>
+                                    <td>${student.student_id}</td>
+                                </tr>
+                                <tr>
+                                    <td class="label">IC Number:</td>
+                                    <td>${student.ic_number}</td>
+                                </tr>
+                                <tr>
+                                    <td class="label">Days Absent:</td>
+                                    <td><strong>${daysAbsent} day${daysAbsent > 1 ? 's' : ''}</strong></td>
+                                </tr>
+                                <tr>
+                                    <td class="label">Alert Type:</td>
+                                    <td><strong style="color: ${alertType.includes('URGENT') ? '#ff1744' : '#ff9800'}">${alertType}</strong></td>
+                                </tr>
+                                <tr>
+                                    <td class="label">Date:</td>
+                                    <td>${new Date().toLocaleDateString()}</td>
+                                </tr>
+                            </table>
+                            
+                            <p style="background: #fff3e0; padding: 15px; border-radius: 5px; border-left: 4px solid #ff9800;">
+                                <strong>Action Required:</strong> Please follow up with this student regarding their attendance.
+                            </p>
+                            
+                            <div style="text-align: center; margin-top: 30px;">
+                                <a href="https://rollcall-frontend.vercel.app/login.html" 
+                                   style="background: linear-gradient(135deg, #00f2fe, #4facfe); 
+                                          color: #0a0f1f; 
+                                          padding: 12px 30px; 
+                                          text-decoration: none; 
+                                          border-radius: 5px; 
+                                          font-weight: bold;
+                                          display: inline-block;">
+                                    🔐 Login to Dashboard
+                                </a>
                             </div>
                         </div>
-                    </body>
-                    </html>
-                `
-            };
-
-            try {
-                console.log(`📧 Sending email for ${student.student_name} via SendGrid...`);
-                await sgMail.send(msg);
-                console.log(`✅ Email sent successfully for ${student.student_name}`);
-            } catch (error) {
-                console.error(`❌ Failed to send email for ${student.student_name}:`, error.message);
-                if (error.response) {
-                    console.error('SendGrid response:', error.response.body);
-                }
-            }
+                        <div class="footer">
+                            <p>This is an automated message from your Rollcall Attendance System.</p>
+                            <p style="font-size: 10px;">© ${new Date().getFullYear()} Rollcall Scanner</p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+            `;
+            
+            const subject = `⚠️ Attendance Alert: ${student.student_name} - ${alertType}`;
+            
+            // Send using Gmail API
+            await sendEmailViaGmail(recipient, subject, htmlContent);
         });
     });
 }
+
 // Check for absent students
 async function checkAbsences() {
     console.log('🔍 Running absence check at:', new Date().toLocaleString());
@@ -558,5 +625,5 @@ app.delete('/api/holidays/:id', requireLogin, (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`📧 Email configured for: ${process.env.EMAIL_USER || 'Not set'}`);
+    console.log(`📧 Gmail API configured for: ${process.env.GMAIL_CLIENT_ID ? 'Yes' : 'No'}`);
 });
