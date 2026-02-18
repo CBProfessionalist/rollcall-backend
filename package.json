@@ -1,7 +1,6 @@
 {
   "name": "rollcall-backend",
   "version": "1.0.0",
-  "description": "Rollcall Barcode Scanner Backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -14,7 +13,6 @@
     "body-parser": "^1.20.2",
     "express-session": "^1.17.3",
     "node-cron": "^3.0.3",
-    "googleapis": "^128.0.0",
-    "@google-cloud/local-auth": "^2.1.0"
+    "@novu/node": "^2.0.0"
   }
 }
