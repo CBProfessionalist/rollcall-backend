@@ -5,7 +5,6 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const session = require('express-session');
 const cron = require('node-cron');
-const { Novu } = require('@novu/node');
 
 const app = express();
 
@@ -64,33 +63,56 @@ const requireLogin = (req, res, next) => {
     }
 };
 
-// ========== NOVU CONFIGURATION ==========
-// Initialize Novu with your API key
-const novu = new Novu(process.env.NOVU_API_KEY);
+// ========== TELEGRAM DIRECT INTEGRATION ==========
+// Store sent alerts to prevent duplicates
+const sentAlerts = new Set();
 
-// Test Novu connection
-async function testNovuConnection() {
+// Function to send Telegram message directly
+async function sendTelegramMessage(chatId, message) {
+    const botToken = process.env.TELEGRAM_BOT_TOKEN;
+    
+    if (!botToken) {
+        console.error('❌ TELEGRAM_BOT_TOKEN not configured');
+        return false;
+    }
+    
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    
     try {
-        // Simple API call to verify connection
-        await novu.subscribers.list({ page: 0, limit: 1 });
-        console.log('✅ Novu connected successfully');
-        return true;
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                chat_id: chatId,
+                text: message,
+                parse_mode: 'Markdown'
+            })
+        });
+        
+        const data = await response.json();
+        if (data.ok) {
+            console.log('✅ Telegram message sent');
+            return true;
+        } else {
+            console.error('❌ Telegram error:', data.description);
+            return false;
+        }
     } catch (error) {
-        console.error('❌ Novu connection failed:', error.message);
+        console.error('❌ Failed to send Telegram message:', error.message);
         return false;
     }
 }
-
-testNovuConnection();
-
-// Store sent alerts to prevent duplicates
-const sentAlerts = new Set();
 
 // ========== NOTIFICATION FUNCTION ==========
 async function sendAttendanceAlert(student, daysAbsent, alertType) {
     // Check if notifications are enabled in settings
     db.query('SELECT setting_value FROM settings WHERE setting_key = "notifications_enabled"', async (err, result) => {
-        if (err || result.length === 0) return;
+        if (err || result.length === 0) {
+            console.error('❌ Error checking notification settings:', err);
+            return;
+        }
         
         const notificationsEnabled = result[0].setting_value === 'true';
         if (!notificationsEnabled) {
@@ -98,9 +120,12 @@ async function sendAttendanceAlert(student, daysAbsent, alertType) {
             return;
         }
         
-        // Get admin Telegram/Chat ID from settings
+        // Get admin Telegram Chat ID from settings
         db.query('SELECT setting_value FROM settings WHERE setting_key = "chat_id"', async (err, chatResult) => {
-            if (err) return;
+            if (err) {
+                console.error('❌ Error fetching chat ID:', err);
+                return;
+            }
             
             const chatId = (chatResult && chatResult[0]) ? 
                 chatResult[0].setting_value : 
@@ -113,33 +138,22 @@ async function sendAttendanceAlert(student, daysAbsent, alertType) {
             
             console.log(`📱 Sending ${alertType} alert for ${student.student_name}`);
             
-            try {
-                // Trigger Novu workflow
-                const result = await novu.trigger('attendance-alert', { // Your workflow trigger ID
-                    to: {
-                        subscriberId: 'admin-1',
-                        chat: {
-                            phoneNumber: chatId // For Telegram, this is the chat ID
-                        }
-                    },
-                    payload: {
-                        studentName: student.student_name,
-                        studentId: student.student_id,
-                        icNumber: student.ic_number,
-                        alertType: alertType,
-                        daysAbsent: daysAbsent,
-                        date: new Date().toLocaleDateString()
-                    }
-                });
-                
-                console.log(`✅ Notification sent for ${student.student_name}`);
-                console.log(`📊 Novu transaction ID: ${result.data.transactionId}`);
-            } catch (error) {
-                console.error(`❌ Failed to send notification:`, error.message);
-                if (error.response) {
-                    console.error('Novu response:', error.response.data);
-                }
-            }
+            // Format message with Markdown
+            const message = `
+🎓 *Rollcall Attendance Alert*
+
+*Student:* ${student.student_name}
+*ID:* ${student.student_id}
+*IC:* ${student.ic_number}
+*Alert:* ${alertType}
+*Days Absent:* ${daysAbsent}
+*Date:* ${new Date().toLocaleDateString()}
+
+Please follow up with this student.
+            `;
+            
+            // Send directly to Telegram
+            await sendTelegramMessage(chatId, message);
         });
     });
 }
@@ -168,7 +182,10 @@ async function checkAbsences() {
                 'SELECT * FROM attendance WHERE student_id = ? AND scan_date >= ?',
                 [student.student_id, fiveDaysAgoStr],
                 async (err, attendance) => {
-                    if (err) return;
+                    if (err) {
+                        console.error('❌ Error fetching attendance:', err);
+                        return;
+                    }
                     
                     const daysAbsent = 5 - attendance.length;
                     if (daysAbsent === 0) return;
@@ -176,19 +193,49 @@ async function checkAbsences() {
                     // Create unique key for this alert
                     const alertKey = `${student.id}_${today}_${daysAbsent}`;
                     
-                    // Send alerts based on absence duration
-                    if (daysAbsent >= 5 && !sentAlerts.has(alertKey + '_5')) {
-                        await sendAttendanceAlert(student, daysAbsent, '5+ DAYS - URGENT');
-                        sentAlerts.add(alertKey + '_5');
-                    }
-                    else if (daysAbsent === 3 && !sentAlerts.has(alertKey + '_3')) {
-                        await sendAttendanceAlert(student, daysAbsent, '3 DAYS CONSECUTIVE');
-                        sentAlerts.add(alertKey + '_3');
-                    }
-                    else if (daysAbsent === 1 && !sentAlerts.has(alertKey + '_1')) {
-                        await sendAttendanceAlert(student, daysAbsent, '1 DAY ABSENCE');
-                        sentAlerts.add(alertKey + '_1');
-                    }
+                    // Check if weekend/holiday exclusions apply
+                    db.query('SELECT setting_value FROM settings WHERE setting_key IN ("weekend_off", "holiday_off")', async (err, settings) => {
+                        if (err) return;
+                        
+                        const weekendOff = settings.find(s => s.setting_key === 'weekend_off')?.setting_value === 'true';
+                        const holidayOff = settings.find(s => s.setting_key === 'holiday_off')?.setting_value === 'true';
+                        
+                        // Check if today is a holiday
+                        if (holidayOff) {
+                            db.query('SELECT * FROM holidays WHERE holiday_date = ?', [today], (err, holidays) => {
+                                if (holidays && holidays.length > 0) {
+                                    console.log('📅 Today is a holiday, skipping alerts');
+                                    return;
+                                }
+                            });
+                        }
+                        
+                        // Check if today is weekend
+                        const dayOfWeek = new Date().getDay();
+                        const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+                        
+                        if (weekendOff && isWeekend) {
+                            console.log('📅 Today is weekend, skipping alerts');
+                            return;
+                        }
+                        
+                        // Send alerts based on absence duration
+                        if (daysAbsent >= 5 && !sentAlerts.has(alertKey + '_5')) {
+                            console.log(`⚠️ Sending URGENT alert for ${student.student_name} (${daysAbsent} days)`);
+                            await sendAttendanceAlert(student, daysAbsent, '5+ DAYS - URGENT');
+                            sentAlerts.add(alertKey + '_5');
+                        }
+                        else if (daysAbsent === 3 && !sentAlerts.has(alertKey + '_3')) {
+                            console.log(`⚠️ Sending 3-day alert for ${student.student_name}`);
+                            await sendAttendanceAlert(student, daysAbsent, '3 DAYS CONSECUTIVE');
+                            sentAlerts.add(alertKey + '_3');
+                        }
+                        else if (daysAbsent === 1 && !sentAlerts.has(alertKey + '_1')) {
+                            console.log(`⚠️ Sending 1-day alert for ${student.student_name}`);
+                            await sendAttendanceAlert(student, daysAbsent, '1 DAY ABSENCE');
+                            sentAlerts.add(alertKey + '_1');
+                        }
+                    });
                 }
             );
         }
@@ -244,6 +291,7 @@ app.get('/', (req, res) => {
 
 // Manual trigger endpoint
 app.get('/api/check-absences', requireLogin, (req, res) => {
+    console.log('👤 Manual absence check triggered by:', req.session.username);
     checkAbsences();
     res.json({ message: 'Absence check started' });
 });
@@ -413,4 +461,5 @@ app.delete('/api/holidays/:id', requireLogin, (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📱 Telegram notifications: ${process.env.TELEGRAM_BOT_TOKEN ? 'Configured' : 'Not configured'}`);
 });
