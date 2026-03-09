@@ -5,6 +5,9 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const session = require('express-session');
 const cron = require('node-cron');
+const ExcelJS = require('exceljs');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 
@@ -103,6 +106,162 @@ async function sendTelegramMessage(chatId, message) {
         console.error('❌ Failed to send Telegram message:', error.message);
         return false;
     }
+}
+
+// ========== HELPER FUNCTIONS FOR REPORTS ==========
+
+// Format date helper
+function formatDate(date) {
+    return new Date(date).toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    });
+}
+
+// Generate a visual progress bar
+function getProgressBar(percentage) {
+    const filled = Math.floor(percentage / 10);
+    const empty = 10 - filled;
+    return '█'.repeat(filled) + '░'.repeat(empty);
+}
+
+// Get attendance summary for reporting
+async function getAttendanceSummary(startDate, endDate, studentId = null) {
+    return new Promise((resolve, reject) => {
+        let query = `
+            SELECT 
+                s.student_id,
+                s.student_name,
+                s.ic_number,
+                COUNT(a.id) as days_present,
+                DATEDIFF(?, ?) + 1 as total_days,
+                (DATEDIFF(?, ?) + 1 - COUNT(a.id)) as days_absent
+            FROM students s
+            LEFT JOIN attendance a ON s.student_id = a.student_id 
+                AND a.scan_date BETWEEN ? AND ?
+        `;
+        
+        const params = [endDate, startDate, endDate, startDate, startDate, endDate];
+        
+        if (studentId) {
+            query += ' WHERE s.student_id = ?';
+            params.push(studentId);
+        }
+        
+        query += ' GROUP BY s.id ORDER BY s.student_id';
+        
+        db.query(query, params, (err, results) => {
+            if (err) reject(err);
+            else resolve(results);
+        });
+    });
+}
+
+// Get detailed attendance records
+async function getDetailedAttendance(startDate, endDate, studentId = null) {
+    return new Promise((resolve, reject) => {
+        let query = `
+            SELECT 
+                a.scan_date,
+                a.scan_time,
+                a.student_id,
+                a.student_name,
+                a.ic_number,
+                a.status
+            FROM attendance a
+            WHERE a.scan_date BETWEEN ? AND ?
+        `;
+        
+        const params = [startDate, endDate];
+        
+        if (studentId) {
+            query += ' AND a.student_id = ?';
+            params.push(studentId);
+        }
+        
+        query += ' ORDER BY a.scan_datetime DESC';
+        
+        db.query(query, params, (err, results) => {
+            if (err) reject(err);
+            else resolve(results);
+        });
+    });
+}
+
+// Format attendance data as a beautiful table for Telegram
+function formatAttendanceTable(records, summary, period, startDate, endDate) {
+    const days = period === 'daily' ? 1 : 7;
+    const lines = [];
+    
+    // Header with decoration
+    lines.push(`📋 *ATTENDANCE REPORT - ${period === 'daily' ? 'DAILY' : 'WEEKLY'}*`);
+    lines.push(`📅 ${startDate}${period === 'weekly' ? ` to ${endDate}` : ''}`);
+    lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    
+    if (period === 'daily') {
+        // Daily table with time
+        lines.push(`🆔  NAME         STATUS   TIME    `);
+        lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        
+        // Group by student for daily report
+        const studentMap = new Map();
+        records.forEach(record => {
+            if (!studentMap.has(record.student_id)) {
+                studentMap.set(record.student_id, {
+                    name: record.student_name,
+                    time: record.scan_time,
+                    present: true
+                });
+            }
+        });
+        
+        // Add all students (including absent ones)
+        summary.forEach(student => {
+            const scanned = studentMap.get(student.student_id);
+            const status = scanned ? '✅ Present' : '❌ Absent ';
+            const time = scanned ? scanned.time : '--    ';
+            
+            // Format name with fixed width
+            const name = student.student_name.padEnd(12).substring(0, 12);
+            lines.push(`${student.student_id} ${name}${status} ${time}`);
+        });
+        
+    } else {
+        // Weekly summary table with counts
+        lines.push(`🆔  NAME         PRESENT/DAYS  %    `);
+        lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        
+        summary.forEach(student => {
+            const rate = ((student.days_present / days) * 100).toFixed(0);
+            
+            // Format name with fixed width
+            const name = student.student_name.padEnd(12).substring(0, 12);
+            lines.push(`${student.student_id} ${name} ${student.days_present}/${days} days  ${rate}%`);
+            lines.push(`    ${getProgressBar(rate)}`);
+        });
+    }
+    
+    // Footer with summary statistics
+    lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    
+    const totalPresent = summary.reduce((sum, s) => sum + s.days_present, 0);
+    const totalPossible = summary.length * days;
+    const overallRate = ((totalPresent / totalPossible) * 100).toFixed(1);
+    
+    if (period === 'daily') {
+        const present = summary.filter(s => s.days_present > 0).length;
+        const absent = summary.length - present;
+        lines.push(`✅ *Present:* ${present}   ❌ *Absent:* ${absent}   📊 *${overallRate}%*`);
+    } else {
+        lines.push(`📊 *Total Present:* ${totalPresent}/${totalPossible} days`);
+        lines.push(`📈 *Average Attendance:* ${overallRate}%`);
+    }
+    
+    lines.push(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    lines.push(`_Download full report from dashboard_`);
+    
+    return lines.join('\n');
 }
 
 // ========== NOTIFICATION FUNCTION ==========
@@ -241,6 +400,279 @@ async function checkAbsences() {
         }
     });
 }
+
+// ========== REPORT ENDPOINTS ==========
+
+// Generate CSV report
+app.get('/api/reports/csv/:period', requireLogin, async (req, res) => {
+    try {
+        const { period } = req.params;
+        const { student_id } = req.query;
+        
+        let startDate, endDate;
+        const today = new Date();
+        
+        if (period === 'daily') {
+            startDate = today.toISOString().split('T')[0];
+            endDate = startDate;
+        } else if (period === 'weekly') {
+            endDate = today.toISOString().split('T')[0];
+            startDate = new Date(today.setDate(today.getDate() - 6)).toISOString().split('T')[0];
+        } else {
+            return res.status(400).json({ error: 'Invalid period. Use "daily" or "weekly"' });
+        }
+        
+        const records = await getDetailedAttendance(startDate, endDate, student_id);
+        
+        // Create CSV
+        const workbook = new ExcelJS.Workbook();
+        const worksheet = workbook.addWorksheet('Attendance');
+        
+        // Add headers
+        worksheet.columns = [
+            { header: 'Date', key: 'date', width: 15 },
+            { header: 'Time', key: 'time', width: 10 },
+            { header: 'Student ID', key: 'student_id', width: 15 },
+            { header: 'Student Name', key: 'student_name', width: 25 },
+            { header: 'IC Number', key: 'ic_number', width: 20 },
+            { header: 'Status', key: 'status', width: 10 }
+        ];
+        
+        // Add rows
+        records.forEach(record => {
+            worksheet.addRow({
+                date: formatDate(record.scan_date),
+                time: record.scan_time,
+                student_id: record.student_id,
+                student_name: record.student_name,
+                ic_number: record.ic_number,
+                status: record.status
+            });
+        });
+        
+        // Add summary
+        worksheet.addRow({});
+        worksheet.addRow({ date: 'SUMMARY' });
+        worksheet.addRow({ date: `Period: ${formatDate(startDate)} to ${formatDate(endDate)}` });
+        worksheet.addRow({ date: `Total Records: ${records.length}` });
+        
+        if (student_id) {
+            worksheet.addRow({ date: `Filtered by Student ID: ${student_id}` });
+        }
+        
+        // Set response headers
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', `attachment; filename=attendance_${period}_${startDate}.csv`);
+        
+        // Write to response
+        await workbook.csv.write(res);
+        res.end();
+        
+    } catch (error) {
+        console.error('❌ CSV generation error:', error);
+        res.status(500).json({ error: 'Failed to generate report' });
+    }
+});
+
+// Send enhanced table report via Telegram
+app.post('/api/reports/table/:period', requireLogin, async (req, res) => {
+    try {
+        const { period } = req.params;
+        const { student_id, chat_id } = req.body;
+        
+        let startDate, endDate;
+        const today = new Date();
+        
+        if (period === 'daily') {
+            startDate = today.toISOString().split('T')[0];
+            endDate = startDate;
+        } else if (period === 'weekly') {
+            endDate = today.toISOString().split('T')[0];
+            startDate = new Date(today.setDate(today.getDate() - 6)).toISOString().split('T')[0];
+        } else {
+            return res.status(400).json({ error: 'Invalid period. Use "daily" or "weekly"' });
+        }
+        
+        // Get summary and detailed records
+        const summary = await getAttendanceSummary(startDate, endDate, student_id);
+        const records = await getDetailedAttendance(startDate, endDate, student_id);
+        
+        // Get target chat ID
+        let targetChatId = chat_id;
+        if (!targetChatId) {
+            const chatResult = await new Promise((resolve, reject) => {
+                db.query('SELECT setting_value FROM settings WHERE setting_key = "chat_id"', (err, results) => {
+                    if (err) reject(err);
+                    else resolve(results[0]?.setting_value);
+                });
+            });
+            targetChatId = chatResult || process.env.ADMIN_CHAT_ID;
+        }
+        
+        if (!targetChatId) {
+            return res.status(400).json({ error: 'No chat ID configured' });
+        }
+        
+        // Format the table
+        const tableMessage = formatAttendanceTable(records, summary, period, startDate, endDate);
+        
+        // Send to Telegram
+        await sendTelegramMessage(targetChatId, tableMessage);
+        
+        // Also send as file attachment if requested
+        if (req.query.attach === 'true') {
+            // Create CSV file and send as document
+            const workbook = new ExcelJS.Workbook();
+            const worksheet = workbook.addWorksheet('Attendance');
+            
+            worksheet.columns = [
+                { header: 'Date', key: 'date', width: 15 },
+                { header: 'Time', key: 'time', width: 10 },
+                { header: 'Student ID', key: 'student_id', width: 15 },
+                { header: 'Student Name', key: 'student_name', width: 25 },
+                { header: 'Status', key: 'status', width: 10 }
+            ];
+            
+            records.forEach(record => {
+                worksheet.addRow({
+                    date: formatDate(record.scan_date),
+                    time: record.scan_time || '--',
+                    student_id: record.student_id,
+                    student_name: record.student_name,
+                    status: record.status || 'present'
+                });
+            });
+            
+            // Save to temp file
+            const fileName = `attendance_${period}_${startDate}.csv`;
+            const filePath = path.join('/tmp', fileName);
+            await workbook.csv.writeFile(filePath);
+            
+            // Send as document
+            const botToken = process.env.TELEGRAM_BOT_TOKEN;
+            const url = `https://api.telegram.org/bot${botToken}/sendDocument`;
+            
+            const formData = new FormData();
+            formData.append('chat_id', targetChatId);
+            formData.append('document', fs.createReadStream(filePath));
+            formData.append('caption', `📎 Full ${period} attendance report`);
+            
+            await fetch(url, {
+                method: 'POST',
+                body: formData
+            });
+            
+            // Clean up
+            fs.unlinkSync(filePath);
+        }
+        
+        res.json({ 
+            success: true, 
+            message: 'Table report sent to Telegram',
+            summary: {
+                period: period,
+                totalStudents: summary.length,
+                totalRecords: records.length
+            }
+        });
+        
+    } catch (error) {
+        console.error('❌ Table report error:', error);
+        res.status(500).json({ error: 'Failed to send table report' });
+    }
+});
+
+// Get report summary (JSON)
+app.get('/api/reports/summary/:period', requireLogin, async (req, res) => {
+    try {
+        const { period } = req.params;
+        const { student_id } = req.query;
+        
+        let startDate, endDate;
+        const today = new Date();
+        
+        if (period === 'daily') {
+            startDate = today.toISOString().split('T')[0];
+            endDate = startDate;
+        } else if (period === 'weekly') {
+            endDate = today.toISOString().split('T')[0];
+            startDate = new Date(today.setDate(today.getDate() - 6)).toISOString().split('T')[0];
+        } else {
+            return res.status(400).json({ error: 'Invalid period. Use "daily" or "weekly"' });
+        }
+        
+        const summary = await getAttendanceSummary(startDate, endDate, student_id);
+        const records = await getDetailedAttendance(startDate, endDate, student_id);
+        
+        res.json({
+            period: period,
+            startDate: startDate,
+            endDate: endDate,
+            summary: summary,
+            totalRecords: records.length,
+            generatedAt: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('❌ Summary error:', error);
+        res.status(500).json({ error: 'Failed to generate summary' });
+    }
+});
+
+// Schedule automatic daily report at 5 PM
+cron.schedule('0 17 * * *', () => {
+    console.log('⏰ Sending automatic daily report...');
+    
+    // Get admin chat ID
+    db.query('SELECT setting_value FROM settings WHERE setting_key = "chat_id"', async (err, results) => {
+        if (err || !results.length) return;
+        
+        const chatId = results[0].setting_value;
+        if (!chatId) return;
+        
+        const today = new Date().toISOString().split('T')[0];
+        
+        try {
+            const summary = await getAttendanceSummary(today, today);
+            const records = await getDetailedAttendance(today, today);
+            
+            const tableMessage = formatAttendanceTable(records, summary, 'daily', today, today);
+            await sendTelegramMessage(chatId, tableMessage);
+            
+            console.log('✅ Automatic daily report sent');
+        } catch (error) {
+            console.error('❌ Failed to send automatic report:', error);
+        }
+    });
+});
+
+// Schedule automatic weekly report every Friday at 5 PM
+cron.schedule('0 17 * * 5', () => {
+    console.log('⏰ Sending automatic weekly report...');
+    
+    db.query('SELECT setting_value FROM settings WHERE setting_key = "chat_id"', async (err, results) => {
+        if (err || !results.length) return;
+        
+        const chatId = results[0].setting_value;
+        if (!chatId) return;
+        
+        const today = new Date();
+        const endDate = today.toISOString().split('T')[0];
+        const startDate = new Date(today.setDate(today.getDate() - 6)).toISOString().split('T')[0];
+        
+        try {
+            const summary = await getAttendanceSummary(startDate, endDate);
+            const records = await getDetailedAttendance(startDate, endDate);
+            
+            const tableMessage = formatAttendanceTable(records, summary, 'weekly', startDate, endDate);
+            await sendTelegramMessage(chatId, tableMessage);
+            
+            console.log('✅ Automatic weekly report sent');
+        } catch (error) {
+            console.error('❌ Failed to send automatic report:', error);
+        }
+    });
+});
 
 // Schedule absence checks (10 AM daily)
 cron.schedule('0 10 * * *', () => {
